@@ -1,0 +1,31 @@
+[package]
+name = "graphify-light"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "A minimal local static code graph indexer for Codex."
+repository = "https://github.com/victor-bi/grahify-light"
+
+[[bin]]
+name = "graphify-light"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+ignore = "0.4"
+regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tree-sitter = "0.25"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+
+[dev-dependencies]
+tempfile = "3.10"
