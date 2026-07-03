@@ -57,7 +57,7 @@ Query output is JSON.
 Project install:
 
 ```bash
-graphify-light install codex --project
+graphify-light install codex
 ```
 
 This rebuilds `.ai/graphify-light/graph.json`, then updates:
@@ -66,6 +66,12 @@ This rebuilds `.ai/graphify-light/graph.json`, then updates:
 .codex/config.toml
 AGENTS.md
 ```
+
+The project MCP config pins the server to the absolute repository path used
+at install time, so Codex reads this repository's graph even if the MCP
+process is launched from another working directory.
+
+Use `--project` if you prefer to make the default scope explicit.
 
 Global install:
 

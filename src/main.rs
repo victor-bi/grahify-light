@@ -142,11 +142,24 @@ fn main() -> Result<()> {
 fn install_scope(global: bool, project: bool) -> Result<InstallScope> {
     match (global, project) {
         (true, false) => Ok(InstallScope::Global),
-        (false, true) => Ok(InstallScope::Project),
-        _ => bail!("choose exactly one install scope: --global or --project"),
+        (false, false) | (false, true) => Ok(InstallScope::Project),
+        (true, true) => bail!("choose only one install scope: --global or --project"),
     }
 }
 
 fn display_path(path: PathBuf) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_scope_defaults_to_project() {
+        assert!(matches!(
+            install_scope(false, false).unwrap(),
+            InstallScope::Project
+        ));
+    }
 }

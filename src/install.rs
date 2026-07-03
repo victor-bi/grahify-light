@@ -27,11 +27,14 @@ pub fn install_codex(
     scope: InstallScope,
     command: Option<String>,
 ) -> Result<InstallReport> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve root {}", root.display()))?;
     let command = command.unwrap_or_else(|| "graphify-light".to_string());
     let graph_path = match scope {
         InstallScope::Project => {
-            let graph = build_graph(root)?;
-            Some(write_graph(root, &graph)?)
+            let graph = build_graph(&root)?;
+            Some(write_graph(&root, &graph)?)
         }
         InstallScope::Global => None,
     };
@@ -51,7 +54,13 @@ pub fn install_codex(
         &config_path,
         CONFIG_BEGIN,
         CONFIG_END,
-        &codex_config_block(&command),
+        &codex_config_block(
+            &command,
+            match scope {
+                InstallScope::Project => Some(root.as_path()),
+                InstallScope::Global => None,
+            },
+        ),
     )?;
     upsert_managed_block(&agents_path, AGENTS_BEGIN, AGENTS_END, &agents_block())?;
 
@@ -93,7 +102,12 @@ pub fn upsert_managed_block(path: &Path, begin: &str, end: &str, block: &str) ->
     fs::write(path, next).with_context(|| format!("failed to write {}", path.display()))
 }
 
-fn codex_config_block(command: &str) -> String {
+fn codex_config_block(command: &str, project_root: Option<&Path>) -> String {
+    let command = toml_string(command);
+    let root_string = project_root.map(path_string);
+    let cwd = toml_string(root_string.as_deref().unwrap_or("."));
+    let args = toml_array(&["mcp"]);
+
     format!(
         r#"{CONFIG_BEGIN}
 # This section is managed by graphify-light.
@@ -102,9 +116,9 @@ fn codex_config_block(command: &str) -> String {
 # Existing Codex config outside this block must not be modified by graphify-light.
 
 [mcp_servers.graphify-light]
-command = "{command}"
-args = ["mcp"]
-cwd = "."
+command = {command}
+args = {args}
+cwd = {cwd}
 enabled = true
 required = false
 enabled_tools = [
@@ -123,6 +137,23 @@ default_tools_approval_mode = "auto"
 
 {CONFIG_END}"#
     )
+}
+
+fn toml_array(values: &[&str]) -> String {
+    let values = values
+        .iter()
+        .map(|value| toml_string(value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{values}]")
+}
+
+fn toml_string(value: &str) -> String {
+    serde_json::to_string(value).expect("string serialization should not fail")
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn agents_block() -> String {
@@ -182,5 +213,16 @@ mod tests {
         assert!(second.contains("User text"));
         assert!(second.contains("two"));
         assert!(!second.contains("one"));
+    }
+
+    #[test]
+    fn project_config_uses_explicit_root() {
+        let root = Path::new("/tmp/example repo");
+        let block = codex_config_block("graphify-light", Some(root));
+
+        assert!(block.contains(r#"command = "graphify-light""#));
+        assert!(block.contains(r#"args = ["mcp"]"#));
+        assert!(block.contains(r#"cwd = "/tmp/example repo""#));
+        assert!(!block.contains(r#"cwd = ".""#));
     }
 }
