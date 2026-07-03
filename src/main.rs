@@ -1,3 +1,4 @@
+mod config;
 mod detect;
 mod extract;
 mod graph;
@@ -7,8 +8,9 @@ mod query;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
+use config::init_config;
 use graph::{read_graph, write_graph};
-use install::{install_codex, InstallScope};
+use install::{install_codex, uninstall_codex, InstallScope};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -22,6 +24,10 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Build,
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     Query {
         #[command(subcommand)]
         command: QueryCommand,
@@ -30,6 +36,22 @@ enum Command {
     Install {
         #[command(subcommand)]
         command: InstallCommand,
+    },
+    Uninstall {
+        #[arg(long)]
+        global: bool,
+        #[arg(long)]
+        project: bool,
+        #[arg(long)]
+        purge: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    Init {
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -98,6 +120,17 @@ fn main() -> Result<()> {
                 }))?
             );
         }
+        Command::Config { command } => match command {
+            ConfigCommand::Init { force } => {
+                let path = init_config(&root, force)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "config_path": display_path(path)
+                    }))?
+                );
+            }
+        },
         Command::Query { command } => {
             let graph = read_graph(&root)?;
             let result = match command {
@@ -134,6 +167,24 @@ fn main() -> Result<()> {
                 );
             }
         },
+        Command::Uninstall {
+            global,
+            project,
+            purge,
+        } => {
+            let scope = install_scope(global, project)?;
+            let report = uninstall_codex(&root, scope, purge)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "config_path": display_path(report.config_path),
+                    "agents_path": display_path(report.agents_path),
+                    "removed_config_block": report.removed_config_block,
+                    "removed_agents_block": report.removed_agents_block,
+                    "purged_path": report.purged_path.map(display_path)
+                }))?
+            );
+        }
     }
 
     Ok(())

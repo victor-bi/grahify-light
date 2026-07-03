@@ -1,5 +1,5 @@
 use crate::extract::build_graph;
-use crate::graph::write_graph;
+use crate::graph::{output_dir, write_graph};
 use anyhow::{anyhow, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +20,15 @@ pub struct InstallReport {
     pub config_path: PathBuf,
     pub agents_path: PathBuf,
     pub graph_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct UninstallReport {
+    pub config_path: PathBuf,
+    pub agents_path: PathBuf,
+    pub removed_config_block: bool,
+    pub removed_agents_block: bool,
+    pub purged_path: Option<PathBuf>,
 }
 
 pub fn install_codex(
@@ -71,6 +80,43 @@ pub fn install_codex(
     })
 }
 
+pub fn uninstall_codex(root: &Path, scope: InstallScope, purge: bool) -> Result<UninstallReport> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve root {}", root.display()))?;
+    let (config_path, agents_path) = match scope {
+        InstallScope::Project => (root.join(".codex/config.toml"), root.join("AGENTS.md")),
+        InstallScope::Global => {
+            let home = home_dir()?;
+            (
+                home.join(".codex/config.toml"),
+                home.join(".codex/AGENTS.md"),
+            )
+        }
+    };
+
+    let removed_config_block = remove_managed_block(&config_path, CONFIG_BEGIN, CONFIG_END)?;
+    let removed_agents_block = remove_managed_block(&agents_path, AGENTS_BEGIN, AGENTS_END)?;
+    let purged_path = if purge {
+        let dir = output_dir(&root);
+        if dir.exists() {
+            fs::remove_dir_all(&dir)
+                .with_context(|| format!("failed to remove {}", dir.display()))?;
+        }
+        Some(dir)
+    } else {
+        None
+    };
+
+    Ok(UninstallReport {
+        config_path,
+        agents_path,
+        removed_config_block,
+        removed_agents_block,
+        purged_path,
+    })
+}
+
 pub fn upsert_managed_block(path: &Path, begin: &str, end: &str, block: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -100,6 +146,35 @@ pub fn upsert_managed_block(path: &Path, begin: &str, end: &str, block: &str) ->
         format!("{}\n\n{}\n", current.trim_end(), block)
     };
     fs::write(path, next).with_context(|| format!("failed to write {}", path.display()))
+}
+
+pub fn remove_managed_block(path: &Path, begin: &str, end: &str) -> Result<bool> {
+    let Ok(current) = fs::read_to_string(path) else {
+        return Ok(false);
+    };
+    let Some(begin_index) = current.find(begin) else {
+        return Ok(false);
+    };
+    let after_begin = begin_index + begin.len();
+    let Some(relative_end_index) = current[after_begin..].find(end) else {
+        return Err(anyhow!(
+            "managed block in {} starts with '{}' but has no matching end marker '{}'",
+            path.display(),
+            begin,
+            end
+        ));
+    };
+    let end_index = after_begin + relative_end_index + end.len();
+    let before = current[..begin_index].trim_end_matches(['\r', '\n']);
+    let after = current[end_index..].trim_start_matches(['\r', '\n']);
+    let next = match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!("{after}\n"),
+        (false, true) => format!("{before}\n"),
+        (false, false) => format!("{before}\n\n{after}"),
+    };
+    fs::write(path, next).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(true)
 }
 
 fn codex_config_block(command: &str, project_root: Option<&Path>) -> String {
@@ -224,5 +299,78 @@ mod tests {
         assert!(block.contains(r#"args = ["mcp"]"#));
         assert!(block.contains(r#"cwd = "/tmp/example repo""#));
         assert!(!block.contains(r#"cwd = ".""#));
+    }
+
+    #[test]
+    fn managed_block_is_removed_without_touching_user_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        fs::write(&path, "Before\n\nBEGIN\nmanaged\nEND\n\nAfter\n").unwrap();
+
+        let removed = remove_managed_block(&path, "BEGIN", "END").unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+
+        assert!(removed);
+        assert!(content.contains("Before"));
+        assert!(content.contains("After"));
+        assert!(!content.contains("managed"));
+    }
+
+    #[test]
+    fn removing_absent_block_is_noop_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        fs::write(&path, "User text\n").unwrap();
+
+        let removed = remove_managed_block(&path, "BEGIN", "END").unwrap();
+
+        assert!(!removed);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "User text\n");
+    }
+
+    #[test]
+    fn uninstall_project_removes_blocks_and_preserves_graph_without_purge() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(".codex/config.toml");
+        let agents_path = dir.path().join("AGENTS.md");
+        let graph_dir = output_dir(dir.path());
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(&graph_dir).unwrap();
+        fs::write(
+            &config_path,
+            format!("user = true\n\n{CONFIG_BEGIN}\nmanaged\n{CONFIG_END}\n"),
+        )
+        .unwrap();
+        fs::write(
+            &agents_path,
+            format!("User notes\n\n{AGENTS_BEGIN}\nmanaged\n{AGENTS_END}\n"),
+        )
+        .unwrap();
+        fs::write(graph_dir.join("graph.json"), "{}\n").unwrap();
+
+        let report = uninstall_codex(dir.path(), InstallScope::Project, false).unwrap();
+
+        assert!(report.removed_config_block);
+        assert!(report.removed_agents_block);
+        assert!(graph_dir.exists());
+        assert!(fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("user = true"));
+        assert!(fs::read_to_string(&agents_path)
+            .unwrap()
+            .contains("User notes"));
+    }
+
+    #[test]
+    fn uninstall_project_purge_removes_graph_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_dir = output_dir(dir.path());
+        fs::create_dir_all(&graph_dir).unwrap();
+        fs::write(graph_dir.join("graph.json"), "{}\n").unwrap();
+
+        let report = uninstall_codex(dir.path(), InstallScope::Project, true).unwrap();
+
+        assert_eq!(report.purged_path, Some(graph_dir.clone()));
+        assert!(!graph_dir.exists());
     }
 }

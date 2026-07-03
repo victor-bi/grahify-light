@@ -1,145 +1,75 @@
 # Upstream Graphify Review
 
-This document records the upstream Graphify review that shaped `graphify-light`.
+Reviewed on 2026-07-03 against:
 
-Reviewed upstream repository:
+- Repository: <https://github.com/safishamsi/graphify>
+- Local review commit: `cf4b4ef85a72c407b5e1cb5e0678faa0497a2747`
+- Files inspected: `graphify/detect.py`, `graphify/extract.py`, `graphify/manifest_ingest.py`, `graphify/mcp_ingest.py`, `graphify/hooks.py`, `graphify/__main__.py`, and related tests.
 
-- `https://github.com/safishamsi/graphify`
-- `ARCHITECTURE.md`
-- `graphify/detect.py`
-- `graphify/extract.py`
-- `graphify/build.py`
-- `graphify/export.py`
-- `graphify/serve.py`
+## Upstream Detection
 
-## Relevant Upstream Model
+Upstream Graphify classifies files into code, document, paper, image, and video buckets. It recognizes a broad source set: Python, JavaScript, TypeScript, TSX, Go, Rust, Java, Groovy/Gradle, C/C++, Ruby, Swift, Kotlin, C#, Scala, PHP, Lua/Luau, Zig, PowerShell, Elixir, Objective-C, Julia, Vue, Svelte, Astro, Dart, Verilog/SystemVerilog, SQL, R, Fortran, Pascal/Delphi, BYOND DM, .NET project files, Apex, JSON, Terraform/HCL, and shell scripts.
 
-Upstream Graphify documents this core pipeline:
+It also detects Markdown/text/HTML/YAML documents, PDFs, images, Office files, Google Workspace shortcuts, and audio/video. Office and PDF paths have local safety caps. Sensitive files are skipped by directory and filename patterns, including private keys, env files, credential stores, and load-bearing secret/token names.
 
-```text
-detect() -> extract() -> build_graph() -> cluster() -> analyze() -> report() -> export()
-```
+`graphify-light` now mirrors the broad local detection shape for token-free indexing. It uses `.gitignore` through the Rust `ignore` crate, skips dependency/build/noise directories, and keeps stricter local size caps for source, known resources, and unknown resources.
 
-For `graphify-light`, only the deterministic code graph subset is retained:
+## Upstream Extraction
 
-```text
-detect code files -> extract nodes and edges -> build graph data -> export graph.json -> query / MCP
-```
+Upstream code extraction is primarily deterministic Tree-sitter extraction, backed by a language registry-like `LanguageConfig` model plus special extractors. The current upstream dispatch includes dedicated handling for:
 
-The upstream extraction schema is conceptually:
+- Generic Tree-sitter languages such as Python, JS/TS/TSX, Java, Groovy, C/C++, Ruby, C#, Kotlin, Scala, PHP, Lua, Swift.
+- Standalone or specialized extractors for Zig, PowerShell, Elixir, Objective-C, Julia, Fortran, Vue, Svelte, Astro, Dart, Verilog, SQL, Pascal/Delphi, BYOND DM, .NET/XAML/Razor, Apex, Bash, JSON config, Markdown, and Terraform/HCL.
+- Cross-file resolution passes for imports, type references, member calls, and ambiguous call targets.
 
-```json
-{
-  "nodes": [
-    {
-      "id": "unique_string",
-      "label": "human name",
-      "source_file": "path",
-      "source_location": "L42"
-    }
-  ],
-  "edges": [
-    {
-      "source": "id_a",
-      "target": "id_b",
-      "relation": "calls|imports|uses|...",
-      "confidence": "EXTRACTED|INFERRED|AMBIGUOUS"
-    }
-  ]
-}
-```
+`graphify-light` keeps full Tree-sitter extraction for the Rust crate dependencies it already carries: Python, JavaScript, TypeScript, TSX, Rust, Go, Java, C, and C++. Other source formats are registered and indexed with conservative deterministic heuristics until their Rust grammar crates are added.
 
-`graphify-light` preserves the same core `nodes` / `edges` shape, source provenance fields, relationship naming style, and deterministic confidence labels.
+## Special Extractors
 
-## Detection
+Upstream routes important non-source files away from the LLM path when deterministic structure is available:
 
-Upstream Graphify has broad code, document, paper, image, office, and video detection. `graphify-light` only keeps code detection.
+- `manifest_ingest.py` parses package manifests such as `apm.yml`, `pyproject.toml`, `go.mod`, and `pom.xml` into package/dependency graph data.
+- `mcp_ingest.py` parses `.mcp.json`, `mcp.json`, `mcp_servers.json`, and `claude_desktop_config.json`; it indexes server names, commands, packages, and environment variable names while never persisting env values.
+- `extract_json` indexes only config-shaped JSON and skips data-shaped JSON to avoid exploding datasets into key nodes.
+- `extract_terraform` creates resource/data/module/variable/output/provider/local nodes and deterministic `references` or `depends_on` edges.
+- `extract_markdown` creates heading nodes and local document reference edges.
 
-`graphify-light`:
+`graphify-light` implements these same categories in Rust with a token-free default:
 
-- Scans the current repository.
-- Honors `.gitignore` via the `ignore` crate.
-- Skips generated or dependency-heavy directories such as `.git`, `target`, `node_modules`, `.ai/graphify-light`, and build outputs.
-- Sorts files before extraction.
-- Uses repo-relative paths in graph output.
+- Package manifests: `package.json`, `pyproject.toml`, `go.mod`, `pom.xml`, `Cargo.toml`, `composer.json`, and APM YAML.
+- MCP configs: server, command, package, and env-var-name nodes; env values are ignored.
+- JSON/JSONC, TOML, and YAML config extraction with caps; data JSON is file-node-only.
+- Kubernetes YAML resource nodes and references to ConfigMaps, Secrets, ServiceAccounts, and PVCs when present in the same file.
+- Terraform/HCL block nodes plus deterministic references.
+- Markdown/HTML/TXT/RST document headings and local references.
+- PDF, Office, image, audio/video, archive, and unknown-binary resource metadata.
 
-## Extraction
+## Modes And AI Boundary
 
-Upstream Graphify uses Tree-sitter based deterministic extraction for supported source languages, then performs cross-file resolution for imports and calls.
+Upstream Graphify has deterministic AST extraction, but its full pipeline can use assistant LLMs for semantic document, paper, image, and video extraction. The reviewed code and site describe source-code parsing as local Tree-sitter work, while semantic multimedia extraction is outside the AST-only path.
 
-`graphify-light` follows the same conceptual path:
+`graphify-light` now has `.graphify-light.toml` with three modes:
 
-```text
-source file
--> language detection
--> Tree-sitter parser selection where supported
--> AST traversal
--> file/class/function/method/import/call extraction
--> cross-file import and call resolution
--> graph JSON export
-```
+- `none`: default; deterministic Rust extraction and local metadata only.
+- `local_model`: reserved for local OCR/speech/vision extractors; currently degrades to `none` without downloads.
+- `llm`: requires explicit config enablement; currently degrades to `none` and does not call an LLM.
 
-The initial Rust implementation supports Tree-sitter extraction for:
+The graph records `extraction_mode`, `extractor`, and `degraded_reason` metadata so callers can see what actually ran. The default path fails closed: no model download, no remote API, and no token usage.
 
-- Python
-- JavaScript
-- TypeScript
-- TSX
-- Rust
-- Go
-- Java
-- C
-- C++
+## Install, Uninstall, Hooks
 
-Unsupported source extensions use a conservative heuristic fallback. The fallback is intentionally limited to file nodes, simple definitions, imports, and obvious call syntax. This is a documented deviation from upstream and exists only so unsupported languages still produce useful structural anchors instead of an empty graph.
+Upstream Graphify installs skills and assistant guidance across many platforms. Its uninstall path removes managed skill files and managed sections while preserving user-authored content. `hooks.py` manages git post-commit and post-checkout hooks with start/end markers and a pinned Python launcher strategy.
 
-## Build And Export
+`graphify-light` remains Codex-focused:
 
-Upstream Graphify builds a NetworkX graph and exports node-link JSON, restoring directional endpoints for edges such as `calls`.
+- `install codex` writes managed blocks into project or global Codex config and AGENTS guidance.
+- `uninstall` removes only graphify-light managed blocks by default.
+- `uninstall --global` targets global Codex config and global AGENTS guidance.
+- `uninstall --purge` removes `.ai/graphify-light/`.
+- Source files and user content outside managed markers are preserved.
 
-`graphify-light` does not use NetworkX because it is implemented in Rust. Instead, it keeps a typed in-memory graph, deduplicates nodes by ID, deduplicates edges by `(source, target, relation, source_location)`, prunes dangling edges where appropriate, and writes sorted JSON.
+## Intentional Deviations
 
-Intentional export differences:
+`graphify-light` does not implement upstream Graphify's semantic subagent workflow, LLM extraction, embeddings, Leiden/community analysis, reports, HTML visualization, Obsidian export, Neo4j/FalkorDB integration, Google Workspace export, or multi-assistant skill installation.
 
-- The output path is `.ai/graphify-light/graph.json` instead of `graphify-out/graph.json`.
-- No `graph.html`, `GRAPH_REPORT.md`, SVG, GraphML, Obsidian, Neo4j, or visualization artifacts are generated.
-- No clustering, Leiden communities, semantic report, LLM extraction, or embedding fields are generated.
-- Node IDs include sanitized repo-relative file paths with extensions to avoid collisions. This is close to Graphify's stable path-based ID strategy but not byte-identical to every Graphify version.
-
-## Confidence Labels
-
-`graphify-light` keeps Graphify-style labels:
-
-- `EXTRACTED`: Directly present in source syntax, such as definitions, imports, same-file calls, and import-backed cross-file calls.
-- `INFERRED`: Deterministic second-pass inference, such as a cross-file call matched by a unique symbol name without direct import evidence.
-- `AMBIGUOUS`: Reserved for future deterministic extraction cases where the graph can keep an uncertain relationship without pretending it is exact.
-
-No AI, LLM, or embedding process contributes to confidence labels.
-
-## MCP
-
-Upstream Graphify exposes query behavior through an MCP server. `graphify-light` implements only a Codex-focused stdio MCP mode with lower_snake_case tool names and small structured query responses.
-
-The MCP implementation follows the 2025-06-18 MCP lifecycle and tool methods:
-
-- `initialize`
-- `notifications/initialized`
-- `ping`
-- `tools/list`
-- `tools/call`
-
-## Non-Goals
-
-`graphify-light` intentionally excludes:
-
-- AI extraction
-- LLM calls
-- embeddings
-- vector databases
-- reports
-- visualization
-- document/PDF/image/video parsing
-- cloud sync
-- authentication
-- web UI
-- assistant integrations other than Codex
+The Rust graph keeps the same practical shape of nodes, edges, confidence labels, source provenance, and queryable JSON, but its IDs are deterministic Rust IDs based on repo-relative paths and registered extractor semantics rather than byte-identical upstream IDs.

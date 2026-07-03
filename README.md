@@ -36,6 +36,24 @@ The graph is written to:
 
 The output is deterministic for the same repository state: files are processed in sorted order, paths are repo-relative, nodes and edges are sorted before write, and no timestamp is embedded in structural graph content.
 
+By default, extraction mode is `none`: graphify-light uses deterministic Rust parsing and local metadata only. It does not download models, call LLMs, use remote APIs, or spend tokens.
+
+### Config
+
+Generate the default config template:
+
+```bash
+graphify-light config init
+```
+
+This writes:
+
+```text
+.graphify-light.toml
+```
+
+The default template keeps `mode = "none"`. `local_model` and `llm` modes are explicit future-facing switches; the current implementation still fails closed and degrades to `none` instead of calling models.
+
 ### Query
 
 ```bash
@@ -87,6 +105,21 @@ This updates:
 ```
 
 Both commands use managed blocks and leave user content outside those blocks untouched.
+
+Uninstall project integration:
+
+```bash
+graphify-light uninstall
+```
+
+This removes only graphify-light managed blocks from project `.codex/config.toml` and `AGENTS.md`. It does not remove `.ai/graphify-light/graph.json`.
+
+Use `--global` to remove global Codex managed blocks, and `--purge` to remove `.ai/graphify-light/`:
+
+```bash
+graphify-light uninstall --global
+graphify-light uninstall --purge
+```
 
 This is best-effort Codex integration. It exposes `graphify-light mcp` as a local stdio MCP server and gives Codex guidance to prefer graph queries before broad repository scanning, but it does not replace Codex's native file-reading or code-search behavior.
 
@@ -191,6 +224,8 @@ The graph file has the core shape:
 
 Nodes represent code entities such as files, modules, classes, functions, methods, imports, and symbols. Edges represent relationships such as `contains`, `imports`, `imports_from`, `calls`, `references`, `defines`, and `inherits`.
 
+The index also includes token-free structure and metadata for package manifests, MCP configs, JSON/TOML/YAML config, Terraform/HCL, Kubernetes YAML, Markdown/HTML/text documents, PDFs, Office files, images, audio/video, archives, and unknown local resources.
+
 Edge confidence labels are deterministic:
 
 ```text
@@ -200,6 +235,8 @@ AMBIGUOUS
 ```
 
 `graphify-light` does not use AI-generated confidence.
+
+Graph nodes and edges include extraction metadata such as `extraction_mode`, `extractor`, and, when relevant, `degraded_reason`.
 
 ## Upstream Review
 
