@@ -8,6 +8,7 @@ const CONFIG_BEGIN: &str = "# BEGIN graphify-light managed codex mcp config";
 const CONFIG_END: &str = "# END graphify-light managed codex mcp config";
 const AGENTS_BEGIN: &str = "<!-- BEGIN graphify-light managed codex instructions -->";
 const AGENTS_END: &str = "<!-- END graphify-light managed codex instructions -->";
+const AGENTS_TEMPLATE: &str = include_str!("../templates/codex/AGENTS.md");
 
 #[derive(Debug, Clone, Copy)]
 pub enum InstallScope {
@@ -232,34 +233,7 @@ fn path_string(path: &Path) -> String {
 }
 
 fn agents_block() -> String {
-    format!(
-        r#"{AGENTS_BEGIN}
-<!--
-This section is managed by graphify-light.
-It was added by `graphify-light install codex`.
-Existing AGENTS.md content outside this block must not be modified by graphify-light.
--->
-
-## graphify-light code analysis guidance for Codex
-
-When working in a repository that contains `.ai/graphify-light/graph.json`, use the graphify-light MCP tools before broad repository scanning for code analysis, repository navigation, symbol lookup, caller/callee tracing, import analysis, impact analysis, and related-file discovery.
-
-Preferred workflow:
-
-1. Use `get_graph_stats` to confirm the graph index exists and is readable.
-2. Use `refresh_index` if `.ai/graphify-light/graph.json` is missing, stale, or obviously incomplete.
-3. Use `find_symbol` before searching the repository for a function, class, method, module, or symbol.
-4. Use `get_callers` and `get_callees` before manually tracing function calls across files.
-5. Use `get_file_symbols` before reading a full source file.
-6. Use `get_related_files` before opening many files.
-7. Use `get_imports` and `get_exports` before manually inspecting import/export relationships.
-8. Read source files only after graphify-light has identified the relevant files or symbols.
-
-If graphify-light results are missing, stale, incomplete, or conflict with the actual source code, fall back to normal source inspection and mention that the graph index was insufficient.
-
-Do not perform broad full-repository scans as the first step when a graphify-light MCP query can answer the structural question more directly.
-{AGENTS_END}"#
-    )
+    AGENTS_TEMPLATE.trim_end().to_string()
 }
 
 fn home_dir() -> Result<PathBuf> {
@@ -326,6 +300,25 @@ mod tests {
 
         assert!(!removed);
         assert_eq!(fs::read_to_string(&path).unwrap(), "User text\n");
+    }
+
+    #[test]
+    fn agents_template_is_external_and_references_existing_commands() {
+        let block = agents_block();
+
+        assert!(block.starts_with(AGENTS_BEGIN));
+        assert!(block.ends_with(AGENTS_END));
+        assert!(block.contains("`graphify-light build`"));
+        assert!(block.contains("`refresh_index`"));
+        assert!(block.contains("`get_graph_stats`"));
+        assert!(block.contains("`find_symbol`"));
+        assert!(block.contains("`get_callers`"));
+        assert!(block.contains("`get_callees`"));
+        assert!(block.contains("`get_file_symbols`"));
+        assert!(block.contains("`get_related_files`"));
+        assert!(block.contains("`get_imports`"));
+        assert!(block.contains("`get_exports`"));
+        assert!(!block.contains("`rg`"));
     }
 
     #[test]
