@@ -189,26 +189,22 @@ target/debug/graphify-light
 
 ### Install The Release Binary Locally
 
-Use this script to build the release binary and install it into the current user's global bin directory:
+Use `make install` to build the release binary and install it into the current user's global bin directory:
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-cargo build --release
-
-BIN_DIR="$HOME/.local/bin"
-mkdir -p "$BIN_DIR"
-install -m 755 target/release/graphify-light "$BIN_DIR/graphify-light"
-
-echo "Installed graphify-light to $BIN_DIR/graphify-light"
-echo "Make sure $BIN_DIR is on PATH."
+make install
 ```
 
-For a machine-wide install to `/usr/local/bin`, replace the `install` line with:
+By default, this installs to:
+
+```text
+$HOME/.local/bin/graphify-light
+```
+
+For a machine-wide install to `/usr/local/bin`, override `BIN_DIR`:
 
 ```bash
-sudo install -m 755 target/release/graphify-light /usr/local/bin/graphify-light
+sudo make install BIN_DIR=/usr/local/bin
 ```
 
 ## Graph Model
@@ -224,7 +220,7 @@ The graph file has the core shape:
 
 Nodes represent code entities such as files, modules, classes, functions, methods, imports, and symbols. Edges represent relationships such as `contains`, `imports`, `imports_from`, `calls`, `references`, `defines`, and `inherits`.
 
-The index also includes token-free structure and metadata for package manifests, MCP configs, JSON/TOML/YAML config, Terraform/HCL, Kubernetes YAML, Markdown/HTML/text documents, PDFs, Office files, images, audio/video, archives, and unknown local resources.
+The index also includes token-free structure and metadata for package manifests, MCP configs, JSON/TOML/YAML config, Terraform/HCL, Ansible playbooks and roles, Kubernetes YAML, Markdown/HTML/text documents, PDFs, Office files, images, audio/video, archives, and unknown local resources.
 
 Edge confidence labels are deterministic:
 

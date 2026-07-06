@@ -170,8 +170,8 @@ pub fn config_template() -> &'static str {
 # .NET project files, Razor, XAML, and Apex.
 #
 # Token-free config and infrastructure formats include:
-# Terraform/HCL, Kubernetes YAML, JSON/JSONC config, TOML config, YAML config,
-# MCP configs, and package manifests such as package.json, pyproject.toml,
+# Terraform/HCL, Ansible playbooks/roles, Kubernetes YAML, JSON/JSONC config,
+# TOML config, YAML config, MCP configs, and package manifests such as package.json, pyproject.toml,
 # go.mod, pom.xml, Cargo.toml, and composer.json.
 #
 # Token-free resource formats include:

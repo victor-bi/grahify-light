@@ -1,6 +1,7 @@
 use crate::graph::repo_relative_path;
 use anyhow::Result;
 use ignore::{DirEntry, WalkBuilder};
+use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -108,6 +109,7 @@ pub enum ExtractorKind {
     TreeSitter(SupportedLanguage),
     HeuristicCode,
     Terraform,
+    Ansible,
     JsonConfig,
     TomlConfig,
     YamlConfig,
@@ -130,6 +132,7 @@ impl ExtractorKind {
             Self::TreeSitter(_) => "tree_sitter",
             Self::HeuristicCode => "heuristic_code",
             Self::Terraform => "terraform_hcl",
+            Self::Ansible => "ansible",
             Self::JsonConfig => "json_config",
             Self::TomlConfig => "toml_config",
             Self::YamlConfig => "yaml_config",
@@ -243,6 +246,14 @@ fn classify_file(path: &Path) -> Classification {
             "php",
             FileCategory::Code,
             ExtractorKind::HeuristicCode,
+            None,
+        );
+    }
+    if is_yaml_path(path) && is_ansible_yaml(path) {
+        return class(
+            "ansible",
+            FileCategory::Infrastructure,
+            ExtractorKind::Ansible,
             None,
         );
     }
@@ -537,6 +548,111 @@ fn classify_extension(ext: &str) -> Classification {
             ExtractorKind::ResourceMetadata,
             None,
         ),
+    }
+}
+
+fn is_yaml_path(path: &Path) -> bool {
+    matches!(
+        extension_with_dot(path).as_deref(),
+        Some(".yaml") | Some(".yml")
+    )
+}
+
+fn is_ansible_yaml(path: &Path) -> bool {
+    if is_ansible_convention_path(path) {
+        return true;
+    }
+    if path
+        .metadata()
+        .map(|metadata| metadata.len() > MAX_SOURCE_BYTES)
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    yaml_text_looks_ansible(&text)
+}
+
+fn is_ansible_convention_path(path: &Path) -> bool {
+    let parts = path
+        .components()
+        .filter_map(|part| part.as_os_str().to_str())
+        .map(|part| part.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    for window in parts.windows(3) {
+        if window[0] == "roles"
+            && matches!(
+                window[2].as_str(),
+                "tasks" | "handlers" | "defaults" | "vars" | "meta"
+            )
+        {
+            return true;
+        }
+    }
+
+    parts.iter().any(|part| part == "playbooks")
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| {
+                matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "site.yml"
+                        | "site.yaml"
+                        | "playbook.yml"
+                        | "playbook.yaml"
+                        | "ansible.yml"
+                        | "ansible.yaml"
+                )
+            })
+            .unwrap_or(false)
+}
+
+fn yaml_text_looks_ansible(text: &str) -> bool {
+    serde_yaml::Deserializer::from_str(text)
+        .filter_map(|doc| serde_yaml::Value::deserialize(doc).ok())
+        .any(|value| yaml_value_looks_ansible(&value))
+}
+
+fn yaml_value_looks_ansible(value: &serde_yaml::Value) -> bool {
+    let serde_yaml::Value::Sequence(items) = value else {
+        return false;
+    };
+    items.iter().any(|item| {
+        let serde_yaml::Value::Mapping(map) = item else {
+            return false;
+        };
+        map.keys().filter_map(yaml_key_string).any(|key| {
+            matches!(
+                key.as_str(),
+                "hosts"
+                    | "roles"
+                    | "tasks"
+                    | "pre_tasks"
+                    | "post_tasks"
+                    | "handlers"
+                    | "import_playbook"
+                    | "include_tasks"
+                    | "import_tasks"
+                    | "include_role"
+                    | "import_role"
+                    | "ansible.builtin.include_tasks"
+                    | "ansible.builtin.import_tasks"
+                    | "ansible.builtin.include_role"
+                    | "ansible.builtin.import_role"
+            )
+        })
+    })
+}
+
+fn yaml_key_string(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(value) => Some(value.clone()),
+        serde_yaml::Value::Number(value) => Some(value.to_string()),
+        _ => None,
     }
 }
 

@@ -107,6 +107,7 @@ fn extract_detected_file(
         },
         ExtractorKind::HeuristicCode => extract_heuristic(file, &bytes, file_lookup),
         ExtractorKind::Terraform => extract_terraform(file, &bytes),
+        ExtractorKind::Ansible => extract_ansible(file, &bytes),
         ExtractorKind::JsonConfig => extract_json_config(file, &bytes),
         ExtractorKind::TomlConfig => extract_toml_config(file, &bytes),
         ExtractorKind::YamlConfig => extract_yaml_config(file, &bytes),
@@ -516,6 +517,633 @@ fn extract_yaml_config(
         }
     }
     (nodes, edges, ExtractionSidecars::default())
+}
+
+fn extract_ansible(
+    file: &DetectedFile,
+    bytes: &[u8],
+) -> (Vec<Node>, Vec<Edge>, ExtractionSidecars) {
+    let text = String::from_utf8_lossy(bytes);
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    add_file_node(file, &mut nodes);
+
+    let docs = serde_yaml::Deserializer::from_str(&text)
+        .filter_map(|doc| serde_yaml::Value::deserialize(doc).ok())
+        .collect::<Vec<_>>();
+    if docs.is_empty() {
+        return (nodes, edges, ExtractionSidecars::default());
+    }
+
+    let role_context = ansible_role_context(&file.rel_path);
+    let owner_id = if let Some((role, section)) = &role_context {
+        let role_id = add_ansible_role_node(file, &mut nodes, role, 1);
+        edges.push(contains_edge(file, &role_id, 1, "ansible_role"));
+        let component_id = add_ansible_role_component_node(file, &mut nodes, role, section, 1);
+        edges.push(Edge::new(
+            role_id.clone(),
+            component_id.clone(),
+            "contains",
+            CONFIDENCE_EXTRACTED,
+            file.rel_path.clone(),
+            line_location(1),
+            Some("ansible_role_component".to_string()),
+        ));
+        Some((component_id, section.clone(), role_id))
+    } else {
+        None
+    };
+
+    for (doc_idx, doc) in docs.iter().enumerate() {
+        let line = doc_idx + 1;
+        match doc {
+            serde_yaml::Value::Sequence(items) => {
+                if let Some((component_id, section, _role_id)) = &owner_id {
+                    if matches!(section.as_str(), "tasks" | "handlers") {
+                        let task_kind = if section == "handlers" {
+                            "handler"
+                        } else {
+                            "task"
+                        };
+                        add_ansible_tasks(
+                            file,
+                            &mut nodes,
+                            &mut edges,
+                            component_id,
+                            items,
+                            task_kind,
+                            line,
+                        );
+                        continue;
+                    }
+                }
+                add_ansible_playbook_items(file, &mut nodes, &mut edges, items, line);
+            }
+            serde_yaml::Value::Mapping(map) => {
+                if let Some((component_id, section, role_id)) = &owner_id {
+                    match section.as_str() {
+                        "meta" => add_ansible_role_dependencies(
+                            file, &mut nodes, &mut edges, role_id, map, line,
+                        ),
+                        "defaults" | "vars" => add_ansible_variables(
+                            file,
+                            &mut nodes,
+                            &mut edges,
+                            component_id,
+                            map,
+                            line,
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (nodes, edges, ExtractionSidecars::default())
+}
+
+fn add_ansible_playbook_items(
+    file: &DetectedFile,
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+    items: &[serde_yaml::Value],
+    line: usize,
+) {
+    for (idx, item) in items.iter().enumerate() {
+        let item_line = line + idx;
+        let serde_yaml::Value::Mapping(map) = item else {
+            continue;
+        };
+        if let Some(target) = yaml_map_get(map, "import_playbook").and_then(yaml_scalar_string) {
+            let target_id = add_ansible_playbook_ref_node(file, nodes, &target, item_line);
+            edges.push(Edge::new(
+                file_id(&file.rel_path),
+                target_id,
+                "imports",
+                CONFIDENCE_EXTRACTED,
+                file.rel_path.clone(),
+                line_location(item_line),
+                Some("ansible_import_playbook".to_string()),
+            ));
+            continue;
+        }
+
+        let label = yaml_map_get(map, "name")
+            .and_then(yaml_scalar_string)
+            .or_else(|| yaml_map_get(map, "hosts").and_then(yaml_scalar_string))
+            .unwrap_or_else(|| format!("play {}", idx + 1));
+        let play_id = make_id(&[
+            &file.rel_path,
+            "ansible_play",
+            &(idx + 1).to_string(),
+            &label,
+        ]);
+        let mut play_node = child_node(file, play_id.clone(), &label, "ansible_play", item_line);
+        if let Some(hosts) = yaml_map_get(map, "hosts").and_then(yaml_scalar_string) {
+            play_node.metadata.insert("hosts".to_string(), json!(hosts));
+        }
+        nodes.push(play_node);
+        edges.push(contains_edge(file, &play_id, item_line, "ansible_play"));
+
+        if let Some(roles) = yaml_map_get(map, "roles").and_then(serde_yaml::Value::as_sequence) {
+            add_ansible_role_uses(
+                file,
+                nodes,
+                edges,
+                &play_id,
+                roles,
+                item_line,
+                "ansible_roles",
+            );
+        }
+        for key in ["pre_tasks", "tasks", "post_tasks"] {
+            if let Some(tasks) = yaml_map_get(map, key).and_then(serde_yaml::Value::as_sequence) {
+                add_ansible_tasks(file, nodes, edges, &play_id, tasks, "task", item_line);
+            }
+        }
+        if let Some(handlers) =
+            yaml_map_get(map, "handlers").and_then(serde_yaml::Value::as_sequence)
+        {
+            add_ansible_tasks(file, nodes, edges, &play_id, handlers, "handler", item_line);
+        }
+    }
+}
+
+fn add_ansible_tasks(
+    file: &DetectedFile,
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+    owner_id: &str,
+    tasks: &[serde_yaml::Value],
+    task_kind: &str,
+    line: usize,
+) {
+    for (idx, task) in tasks.iter().enumerate() {
+        let task_line = line + idx;
+        let serde_yaml::Value::Mapping(map) = task else {
+            continue;
+        };
+        let label = yaml_map_get(map, "name")
+            .and_then(yaml_scalar_string)
+            .unwrap_or_else(|| format!("{task_kind} {}", idx + 1));
+        let node_type = if task_kind == "handler" {
+            "ansible_handler"
+        } else {
+            "ansible_task"
+        };
+        let task_id = make_id(&[
+            &file.rel_path,
+            "ansible",
+            owner_id,
+            task_kind,
+            &(idx + 1).to_string(),
+            &label,
+        ]);
+        let mut task_node = child_node(file, task_id.clone(), &label, node_type, task_line);
+        if let Some(action) = ansible_task_action(map) {
+            task_node
+                .metadata
+                .insert("action".to_string(), json!(action));
+        }
+        nodes.push(task_node);
+        edges.push(Edge::new(
+            owner_id.to_string(),
+            task_id.clone(),
+            "contains",
+            CONFIDENCE_EXTRACTED,
+            file.rel_path.clone(),
+            line_location(task_line),
+            Some(format!("ansible_{task_kind}")),
+        ));
+
+        add_ansible_task_relationships(file, nodes, edges, &task_id, map, task_line);
+
+        for nested_key in ["block", "rescue", "always"] {
+            if let Some(nested) =
+                yaml_map_get(map, nested_key).and_then(serde_yaml::Value::as_sequence)
+            {
+                add_ansible_tasks(file, nodes, edges, &task_id, nested, "task", task_line);
+            }
+        }
+    }
+}
+
+fn add_ansible_task_relationships(
+    file: &DetectedFile,
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+    task_id: &str,
+    map: &serde_yaml::Mapping,
+    line: usize,
+) {
+    for key in ["include_tasks", "ansible.builtin.include_tasks"] {
+        if let Some(target) = ansible_task_file_arg(yaml_map_get(map, key)) {
+            add_ansible_task_file_edge(file, nodes, edges, task_id, &target, "includes", line);
+        }
+    }
+    for key in ["import_tasks", "ansible.builtin.import_tasks"] {
+        if let Some(target) = ansible_task_file_arg(yaml_map_get(map, key)) {
+            add_ansible_task_file_edge(file, nodes, edges, task_id, &target, "imports", line);
+        }
+    }
+    for key in ["include_role", "ansible.builtin.include_role"] {
+        if let Some(role) = ansible_role_arg(yaml_map_get(map, key)) {
+            add_ansible_role_edge(file, nodes, edges, task_id, &role, "uses_role", line, key);
+        }
+    }
+    for key in ["import_role", "ansible.builtin.import_role"] {
+        if let Some(role) = ansible_role_arg(yaml_map_get(map, key)) {
+            add_ansible_role_edge(file, nodes, edges, task_id, &role, "uses_role", line, key);
+        }
+    }
+    if let Some(notify) = yaml_map_get(map, "notify") {
+        for handler in yaml_string_values(notify) {
+            let handler_id = add_ansible_handler_ref_node(file, nodes, &handler, line);
+            edges.push(Edge::new(
+                task_id.to_string(),
+                handler_id,
+                "notifies",
+                CONFIDENCE_EXTRACTED,
+                file.rel_path.clone(),
+                line_location(line),
+                Some("ansible_notify".to_string()),
+            ));
+        }
+    }
+    if let Some(listen) = yaml_map_get(map, "listen") {
+        for topic in yaml_string_values(listen) {
+            let topic_id = add_ansible_handler_topic_node(file, nodes, &topic, line);
+            edges.push(Edge::new(
+                task_id.to_string(),
+                topic_id,
+                "listens_to",
+                CONFIDENCE_EXTRACTED,
+                file.rel_path.clone(),
+                line_location(line),
+                Some("ansible_handler_listen".to_string()),
+            ));
+        }
+    }
+}
+
+fn add_ansible_role_uses(
+    file: &DetectedFile,
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+    owner_id: &str,
+    roles: &[serde_yaml::Value],
+    line: usize,
+    context: &str,
+) {
+    for (idx, role_value) in roles.iter().enumerate() {
+        if let Some(role) = ansible_role_arg(Some(role_value)) {
+            add_ansible_role_edge(
+                file,
+                nodes,
+                edges,
+                owner_id,
+                &role,
+                "uses_role",
+                line + idx,
+                context,
+            );
+        }
+    }
+}
+
+fn add_ansible_role_dependencies(
+    file: &DetectedFile,
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+    role_id: &str,
+    map: &serde_yaml::Mapping,
+    line: usize,
+) {
+    let Some(dependencies) =
+        yaml_map_get(map, "dependencies").and_then(serde_yaml::Value::as_sequence)
+    else {
+        return;
+    };
+    for (idx, dependency) in dependencies.iter().enumerate() {
+        if let Some(role) = ansible_role_arg(Some(dependency)) {
+            add_ansible_role_edge(
+                file,
+                nodes,
+                edges,
+                role_id,
+                &role,
+                "depends_on",
+                line + idx,
+                "ansible_role_dependency",
+            );
+        }
+    }
+}
+
+fn add_ansible_variables(
+    file: &DetectedFile,
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+    owner_id: &str,
+    map: &serde_yaml::Mapping,
+    line: usize,
+) {
+    for (idx, key) in map.keys().filter_map(yaml_key_string).take(200).enumerate() {
+        let var_id = make_id(&[&file.rel_path, "ansible_var", &key]);
+        let mut var_node = child_node(file, var_id.clone(), &key, "ansible_variable", line + idx);
+        var_node.metadata.insert("name".to_string(), json!(key));
+        nodes.push(var_node);
+        edges.push(Edge::new(
+            owner_id.to_string(),
+            var_id,
+            "contains",
+            CONFIDENCE_EXTRACTED,
+            file.rel_path.clone(),
+            line_location(line + idx),
+            Some("ansible_variable".to_string()),
+        ));
+    }
+}
+
+fn add_ansible_role_edge(
+    file: &DetectedFile,
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+    source_id: &str,
+    role: &str,
+    relation: &str,
+    line: usize,
+    context: &str,
+) {
+    let role_id = add_ansible_role_node(file, nodes, role, line);
+    edges.push(Edge::new(
+        source_id.to_string(),
+        role_id,
+        relation,
+        CONFIDENCE_EXTRACTED,
+        file.rel_path.clone(),
+        line_location(line),
+        Some(context.to_string()),
+    ));
+}
+
+fn add_ansible_task_file_edge(
+    file: &DetectedFile,
+    nodes: &mut Vec<Node>,
+    edges: &mut Vec<Edge>,
+    source_id: &str,
+    target: &str,
+    relation: &str,
+    line: usize,
+) {
+    let target_path = resolve_ansible_relative_path(&file.rel_path, target);
+    let target_id = add_ansible_task_file_node(file, nodes, &target_path, line);
+    edges.push(Edge::new(
+        source_id.to_string(),
+        target_id,
+        relation,
+        CONFIDENCE_EXTRACTED,
+        file.rel_path.clone(),
+        line_location(line),
+        Some("ansible_task_file".to_string()),
+    ));
+}
+
+fn add_ansible_role_node(
+    file: &DetectedFile,
+    nodes: &mut Vec<Node>,
+    role: &str,
+    line: usize,
+) -> String {
+    let role_id = make_id(&["ansible", "role", role]);
+    let mut node = child_node(file, role_id.clone(), role, "ansible_role", line);
+    node.metadata.insert("role".to_string(), json!(role));
+    nodes.push(node);
+    role_id
+}
+
+fn add_ansible_role_component_node(
+    file: &DetectedFile,
+    nodes: &mut Vec<Node>,
+    role: &str,
+    section: &str,
+    line: usize,
+) -> String {
+    let node_type = match section {
+        "tasks" => "ansible_task_file",
+        "handlers" => "ansible_handler_file",
+        "defaults" | "vars" => "ansible_vars_file",
+        "meta" => "ansible_role_meta",
+        _ => "ansible_role_component",
+    };
+    let component_id = make_id(&["ansible", "role", role, section, &file.rel_path]);
+    let mut node = child_node(
+        file,
+        component_id.clone(),
+        format!("{role}/{section}"),
+        node_type,
+        line,
+    );
+    node.metadata.insert("role".to_string(), json!(role));
+    node.metadata
+        .insert("section".to_string(), json!(section.to_string()));
+    nodes.push(node);
+    component_id
+}
+
+fn add_ansible_task_file_node(
+    file: &DetectedFile,
+    nodes: &mut Vec<Node>,
+    path: &str,
+    line: usize,
+) -> String {
+    let node_id = make_id(&["ansible", "task_file", path]);
+    nodes.push(child_node(
+        file,
+        node_id.clone(),
+        path,
+        "ansible_task_file",
+        line,
+    ));
+    node_id
+}
+
+fn add_ansible_playbook_ref_node(
+    file: &DetectedFile,
+    nodes: &mut Vec<Node>,
+    path: &str,
+    line: usize,
+) -> String {
+    let path = resolve_ansible_relative_path(&file.rel_path, path);
+    let node_id = make_id(&["ansible", "playbook", &path]);
+    nodes.push(child_node(
+        file,
+        node_id.clone(),
+        path,
+        "ansible_playbook",
+        line,
+    ));
+    node_id
+}
+
+fn add_ansible_handler_ref_node(
+    file: &DetectedFile,
+    nodes: &mut Vec<Node>,
+    handler: &str,
+    line: usize,
+) -> String {
+    let handler_id = make_id(&["ansible", "handler", handler]);
+    nodes.push(child_node(
+        file,
+        handler_id.clone(),
+        handler,
+        "ansible_handler",
+        line,
+    ));
+    handler_id
+}
+
+fn add_ansible_handler_topic_node(
+    file: &DetectedFile,
+    nodes: &mut Vec<Node>,
+    topic: &str,
+    line: usize,
+) -> String {
+    let topic_id = make_id(&["ansible", "handler_topic", topic]);
+    nodes.push(child_node(
+        file,
+        topic_id.clone(),
+        topic,
+        "ansible_handler_topic",
+        line,
+    ));
+    topic_id
+}
+
+fn ansible_role_context(rel_path: &str) -> Option<(String, String)> {
+    let parts = rel_path.split('/').collect::<Vec<_>>();
+    for window in parts.windows(3) {
+        if window[0] == "roles"
+            && matches!(
+                window[2],
+                "tasks" | "handlers" | "defaults" | "vars" | "meta"
+            )
+        {
+            return Some((window[1].to_string(), window[2].to_string()));
+        }
+    }
+    None
+}
+
+fn ansible_task_action(map: &serde_yaml::Mapping) -> Option<String> {
+    map.keys()
+        .filter_map(yaml_key_string)
+        .find(|key| !is_ansible_task_keyword(key))
+}
+
+fn is_ansible_task_keyword(key: &str) -> bool {
+    matches!(
+        key,
+        "name"
+            | "when"
+            | "tags"
+            | "vars"
+            | "register"
+            | "notify"
+            | "listen"
+            | "become"
+            | "become_user"
+            | "delegate_to"
+            | "with_items"
+            | "loop"
+            | "loop_control"
+            | "changed_when"
+            | "failed_when"
+            | "ignore_errors"
+            | "check_mode"
+            | "args"
+            | "environment"
+            | "block"
+            | "rescue"
+            | "always"
+    )
+}
+
+fn ansible_task_file_arg(value: Option<&serde_yaml::Value>) -> Option<String> {
+    match value? {
+        serde_yaml::Value::String(value) => clean_ansible_ref(value),
+        serde_yaml::Value::Mapping(map) => yaml_map_get(map, "file").and_then(yaml_scalar_string),
+        _ => None,
+    }
+}
+
+fn ansible_role_arg(value: Option<&serde_yaml::Value>) -> Option<String> {
+    match value? {
+        serde_yaml::Value::String(value) => clean_ansible_ref(value),
+        serde_yaml::Value::Mapping(map) => yaml_map_get(map, "role")
+            .or_else(|| yaml_map_get(map, "name"))
+            .and_then(yaml_scalar_string),
+        _ => None,
+    }
+}
+
+fn clean_ansible_ref(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.contains("{{") || trimmed.contains("{%") {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn yaml_scalar_string(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(value) => clean_ansible_ref(value),
+        serde_yaml::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn yaml_string_values(value: &serde_yaml::Value) -> Vec<String> {
+    match value {
+        serde_yaml::Value::Sequence(items) => items
+            .iter()
+            .filter_map(yaml_scalar_string)
+            .collect::<Vec<_>>(),
+        _ => yaml_scalar_string(value).into_iter().collect(),
+    }
+}
+
+fn yaml_map_get<'a>(map: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde_yaml::Value> {
+    map.get(serde_yaml::Value::String(key.to_string()))
+}
+
+fn resolve_ansible_relative_path(current_file: &str, target: &str) -> String {
+    if target.starts_with('/') {
+        return normalize_rel_path(target.trim_start_matches('/'));
+    }
+    let base = Path::new(current_file)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    normalize_rel_path(&base.join(target).to_string_lossy())
+}
+
+fn normalize_rel_path(path: &str) -> String {
+    let mut parts = Vec::new();
+    for part in Path::new(path).components() {
+        let value = part.as_os_str().to_string_lossy();
+        match value.as_ref() {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(value.to_string()),
+        }
+    }
+    parts.join("/")
 }
 
 fn extract_terraform(
@@ -2718,6 +3346,102 @@ spec:
         }));
         assert!(graph.nodes.iter().all(|node| {
             node.metadata.get("extraction_mode").and_then(Value::as_str) == Some("none")
+        }));
+    }
+
+    #[test]
+    fn indexes_ansible_playbooks_roles_tasks_and_handlers() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("roles/web/tasks")).unwrap();
+        fs::create_dir_all(dir.path().join("roles/web/handlers")).unwrap();
+        fs::create_dir_all(dir.path().join("roles/web/meta")).unwrap();
+
+        fs::write(
+            dir.path().join("site.yml"),
+            r#"
+- name: Configure web
+  hosts: web
+  roles:
+    - web
+  tasks:
+    - name: Include extra tasks
+      include_tasks: extra.yml
+    - name: Pull common role
+      import_role:
+        name: common
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("roles/web/tasks/main.yml"),
+            r#"
+- name: Render config
+  ansible.builtin.template:
+    src: app.conf.j2
+    dest: /etc/app.conf
+  notify: Restart web
+- name: Import package tasks
+  import_tasks: packages.yml
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("roles/web/handlers/main.yml"),
+            r#"
+- name: Restart web
+  ansible.builtin.service:
+    name: httpd
+    state: restarted
+  listen: restart services
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("roles/web/meta/main.yml"),
+            r#"
+dependencies:
+  - role: common
+"#,
+        )
+        .unwrap();
+
+        let graph = build_graph(dir.path()).unwrap();
+        let web_role = graph
+            .nodes
+            .iter()
+            .find(|node| node.node_type.as_deref() == Some("ansible_role") && node.label == "web")
+            .unwrap();
+        let common_role = graph
+            .nodes
+            .iter()
+            .find(|node| {
+                node.node_type.as_deref() == Some("ansible_role") && node.label == "common"
+            })
+            .unwrap();
+
+        assert!(graph.nodes.iter().any(|node| {
+            node.node_type.as_deref() == Some("ansible_play") && node.label == "Configure web"
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.target == web_role.id
+                && edge.relation == "uses_role"
+                && edge.context.as_deref() == Some("ansible_roles")
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == web_role.id
+                && edge.target == common_role.id
+                && edge.relation == "depends_on"
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.relation == "includes" && edge.context.as_deref() == Some("ansible_task_file")
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.relation == "imports" && edge.context.as_deref() == Some("ansible_task_file")
+        }));
+        assert!(graph.edges.iter().any(|edge| edge.relation == "notifies"));
+        assert!(graph.nodes.iter().any(|node| {
+            node.source_file == "site.yml"
+                && node.metadata.get("extractor").and_then(Value::as_str) == Some("ansible")
         }));
     }
 
